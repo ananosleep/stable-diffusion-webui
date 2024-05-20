@@ -1,5 +1,7 @@
 import torch
 from packaging import version
+from einops import repeat
+import math
 
 from modules import devices
 from modules.sd_hijack_utils import CondFunc
@@ -52,6 +54,54 @@ def apply_model(orig_func, self, x_noisy, t, cond, **kwargs):
             return result
 
 
+# Monkey patch to create timestep embed tensor on device, avoiding a block.
+def timestep_embedding(_, timesteps, dim, max_period=10000, repeat_only=False):
+    """
+    Create sinusoidal timestep embeddings.
+    :param timesteps: a 1-D Tensor of N indices, one per batch element.
+                      These may be fractional.
+    :param dim: the dimension of the output.
+    :param max_period: controls the minimum frequency of the embeddings.
+    :return: an [N x dim] Tensor of positional embeddings.
+    """
+    if not repeat_only:
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=timesteps.device) / half
+        )
+        args = timesteps[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    else:
+        embedding = repeat(timesteps, 'b -> b d', d=dim)
+    return embedding
+    
+
+# Monkey patch to SpatialTransformer removing unnecessary contiguous calls.
+# Prevents a lot of unnecessary aten::copy_ calls
+def spatial_transformer_forward(_, self, x: torch.Tensor, context=None):
+    # note: if no context is given, cross-attention defaults to self-attention
+    if not isinstance(context, list):
+        context = [context]
+    b, c, h, w = x.shape
+    x_in = x
+    x = self.norm(x)
+    if not self.use_linear:
+        x = self.proj_in(x)
+    x = x.permute(0, 2, 3, 1).reshape(b, h * w, c)
+    if self.use_linear:
+        x = self.proj_in(x)
+    for i, block in enumerate(self.transformer_blocks):
+        x = block(x, context=context[i])
+    if self.use_linear:
+        x = self.proj_out(x)
+    x = x.view(b, h, w, c).permute(0, 3, 1, 2)
+    if not self.use_linear:
+        x = self.proj_out(x)
+    return x + x_in
+
+
 class GELUHijack(torch.nn.GELU, torch.nn.Module):
     def __init__(self, *args, **kwargs):
         torch.nn.GELU.__init__(self, *args, **kwargs)
@@ -85,6 +135,8 @@ CondFunc('ldm.models.diffusion.ddpm.LatentDiffusion.encode_first_stage', first_s
 CondFunc('ldm.models.diffusion.ddpm.LatentDiffusion.get_first_stage_encoding', lambda orig_func, *args, **kwargs: orig_func(*args, **kwargs).float(), first_stage_cond)
 
 CondFunc('ldm.models.diffusion.ddpm.LatentDiffusion.apply_model', apply_model)
+CondFunc('ldm.modules.diffusionmodules.openaimodel.timestep_embedding', timestep_embedding, lambda *args, **kwargs: True)
+CondFunc('ldm.modules.attention.SpatialTransformer.forward', spatial_transformer_forward, lambda *args, **kwargs: True)
 CondFunc('sgm.modules.diffusionmodules.wrappers.OpenAIWrapper.forward', apply_model)
 
 
